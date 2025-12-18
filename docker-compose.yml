@@ -1,0 +1,24 @@
+services:
+  nano-pearl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: nano-pearl-server
+    network_mode: host
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1'] # select the GPU devices to use
+              capabilities: [gpu]
+    volumes:
+      - ~/models:/weights # volume the model directory
+      - .:/app
+    stdin_open: true
+    tty: true
+    command:
+      - sh
+      - -c
+      - "bash api.sh & bash controller.sh & bash worker.sh; wait"
