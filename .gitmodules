@@ -4,3 +4,6 @@
 [submodule "FastChat"]
 	path = FastChat
 	url = https://github.com/nctu6/FastChat
+[submodule "mini-sglang"]
+	path = mini-sglang
+	url = https://github.com/sgl-project/mini-sglang.git
