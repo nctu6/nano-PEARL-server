@@ -72,6 +72,7 @@ class PEARLEngine:
         max_num_seqs: int = 512,
         max_model_len: int = 4096,
         gpu_memory_utilization: float = 0.9,
+        enable_benchmark: bool = False,
         **kwargs
     ):
         """
@@ -90,6 +91,8 @@ class PEARLEngine:
         
         print("🚀 Initializing PEARL Engine with nano-PEARL KV cache...")
         
+        self.enable_benchmark = enable_benchmark
+        
         # Create nano-PEARL configuration
         self.pearl_config = PEARLConfig(
             draft_model_path=draft_model_path,
@@ -100,6 +103,7 @@ class PEARLEngine:
             max_num_seqs=max_num_seqs,
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
+            enable_benchmark=enable_benchmark,
         )
         
         # Initialize nano-PEARL engine
@@ -157,7 +161,10 @@ class PEARLEngine:
         """Convert mini-sglang sampling params to nano-PEARL format"""
         return PEARLSamplingParams(
             temperature=minisgl_params.temperature,
-            # top_k is not supported in nano-PEARL yet
+            top_k=minisgl_params.top_k,
+            top_p=getattr(minisgl_params, 'top_p', 1.0),
+            frequency_penalty=getattr(minisgl_params, 'frequency_penalty', 0.0),
+            presence_penalty=getattr(minisgl_params, 'presence_penalty', 0.0),
             max_tokens=minisgl_params.max_tokens,
             ignore_eos=minisgl_params.ignore_eos,
         )
@@ -210,11 +217,19 @@ class PEARLEngine:
 
             # 2. Step
             try:
+                # Use a threading lock to ensure only one thread advances the generator at a time
+                # independent of asyncio event loop
+                if not hasattr(self, '_gen_thread_lock'):
+                    import threading
+                    self._gen_thread_lock = threading.Lock()
+
                 def _next():
-                    return next(self.generator)
+                    with self._gen_thread_lock:
+                        return next(self.generator)
                 
-                # Run one step in thread
-                output_tuple, batch_finished = await asyncio.to_thread(_next)
+                # Run one step in thread, shielded from cancellation to ensure
+                # we don't leave a zombie thread holding the generator
+                output_tuple, batch_finished = await asyncio.shield(asyncio.to_thread(_next))
                 self.total_steps += 1  # <--- Increment step counter
                 
                 # Unpack: seq_id, text, tokens, acc_counts, finished_flags

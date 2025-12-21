@@ -14,6 +14,8 @@ else
     PYTHON="python3"
 fi
 
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+
 $PYTHON -m minisgl_pearl.server \
     --model /home/ubuntu/models/Qwen/Qwen3-32B \
     --draft-model /home/ubuntu/models/Qwen/Qwen3-1.7B \
@@ -22,4 +24,7 @@ $PYTHON -m minisgl_pearl.server \
     --port 30000 \
     --host 0.0.0.0 \
     --max-num-seqs 512 \
-    --max-num-batched-tokens 16384
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.85 \
+    --benchmark  # Enable speculative decoding benchmark (optional, comment out to skip)
+

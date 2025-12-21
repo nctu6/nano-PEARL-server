@@ -1,5 +1,7 @@
 # Mini-SGLang-PEARL Integration
 
+**Maintained by Team UnieAI**
+
 Combines mini-sglang's continuous batching infrastructure with nano-PEARL's speculative decoding engine.
 
 ## Architecture
