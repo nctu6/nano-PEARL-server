@@ -89,49 +89,67 @@ async def create_completion(request: Request):
                 outputs = await engine.generate()
                 for output in outputs:
                     if output['request_id'] == request_id:
+                        # Use text_diff if available for proper streaming
+                        chunk_text = output.get('text_diff', output.get('text', ''))
+                        
                         chunk = {
                             "id": request_id,
                             "object": "text_completion",
                             "created": int(time.time()),
                             "model": "pearl",
                             "choices": [{
-                                "text": output['text'],
+                                "text": chunk_text,
                                 "index": 0,
-                                "finish_reason": "stop" if output['finished'] else None,
+                                "finish_reason": "stop" if output.get('finished') else None,
                             }]
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
                         
-                        if output['finished']:
+                        if output.get('finished'):
                             yield "data: [DONE]\n\n"
                             return
                 
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.001)
         
         return StreamingResponse(generate_stream(), media_type="text/event-stream")
     
     else:
         # Non-streaming response
+        final_output = None
         while engine.get_num_unfinished_requests() > 0:
             outputs = await engine.generate()
             for output in outputs:
                 if output['request_id'] == request_id:
-                    return JSONResponse({
-                        "id": request_id,
-                        "object": "text_completion",
-                        "created": int(time.time()),
-                        "model": "pearl",
-                        "choices": [{
-                            "text": output['text'],
-                            "index": 0,
-                            "finish_reason": "stop",
-                        }],
-                        "usage": {
-                            "prompt_tokens": len(prompt_token_ids),
-                            "completion_tokens": output['num_tokens'],
-                            "total_tokens": len(prompt_token_ids) + output['num_tokens'],
-                        }
-                    })
+                    final_output = output
+                    if output.get('finished'):
+                        break
+            
+            if final_output and final_output.get('finished'):
+                break
+                
+            if not final_output or not final_output.get('finished'):
+                await asyncio.sleep(0.001)
+
+        if final_output:
+            return JSONResponse({
+                "id": request_id,
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": "pearl",
+                "choices": [{
+                    "text": final_output['text'],
+                    "index": 0,
+                    "finish_reason": "stop",
+                }],
+                "usage": {
+                    "prompt_tokens": len(prompt_token_ids),
+                    "completion_tokens": final_output['num_tokens'],
+                    "total_tokens": len(prompt_token_ids) + final_output['num_tokens'],
+                }
+            })
+        else:
+            # Should not happen if engine works correctly
+            return JSONResponse({"error": "Request failed"}, status_code=500)
 
 
 @app.get("/health")

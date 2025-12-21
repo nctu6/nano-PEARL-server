@@ -17,7 +17,12 @@ from dataclasses import dataclass
 # Import from mini-sglang for API compatibility
 import sys
 import os
+import time
+import asyncio
+from typing import List, Dict, Any, Union
+import uuid
 
+# ... imports ...
 # Get the base directory of nano-PEARL-server
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
@@ -35,6 +40,7 @@ if os.path.exists(nano_pearl_path):
     sys.path.insert(0, nano_pearl_path)
 from nano_pearl import PEARLConfig, PEARLEngine as NanoPEARLEngine
 from nano_pearl import SamplingParams as PEARLSamplingParams
+from nano_pearl.utils.pearl_logger import logger
 
 
 @dataclass
@@ -104,7 +110,21 @@ class PEARLEngine:
         self.pending_requests: Dict[str, BatchRequest] = {}
         self.running_requests: Dict[str, BatchRequest] = {}
         
+        # Streaming state
+        self.generator = None
+        self.previous_texts = {}
+        self.processed_acc_indices = {}
+        self.generator_start_time = 0
+        self.total_gen_tokens = 0
+        self._lock = None
+        
         print("✅ PEARL Engine initialized with nano-PEARL KV cache")
+
+    @property
+    def lock(self):
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
     
     def add_request(
         self,
@@ -144,67 +164,119 @@ class PEARLEngine:
     
     async def generate(self) -> List[Dict[str, Any]]:
         """
-        Generate tokens using PEARL speculative decoding.
-        
-        Uses continuous batching - processes requests immediately
-        without waiting for batch to fill.
-        
-        Returns:
-            List of generation outputs with request_id and tokens
+        Stream generation output using step-method.
+        Returns partial outputs or empty list if no new data.
         """
-        if not self.pending_requests and not self.running_requests:
-            await asyncio.sleep(0.001)  # Minimal wait, not 1 second!
-            return []
-        
-        # Move pending to running (continuous batching)
-        while self.pending_requests:
-            req_id, req = self.pending_requests.popitem()
-            self.running_requests[req_id] = req
-        
-        if not self.running_requests:
-            return []
-        
-        # Prepare batch for nano-PEARL
-        prompts = []
-        sampling_params_list = []
-        request_ids = []
-        
-        for req_id, req in self.running_requests.items():
-            prompts.append(req.prompt)
-            pearl_params = self._convert_sampling_params(req.sampling_params)
-            sampling_params_list.append(pearl_params)
-            request_ids.append(req_id)
-        
-        # Clear requests for nano-PEARL
-        # self.engine.scheduler.clear()
-        
-        # Add all requests to nano-PEARL engine
-        for prompt, params in zip(prompts, sampling_params_list):
-            self.engine.add_request(prompt, params)
-        
-        # Run PEARL generation with nano-PEARL's KV cache
-        print(f"⚡ Running PEARL generation for {len(prompts)} requests...")
-        text_outputs, token_counts, accept_lengths, mean_acceptance_tokens = \
-            await asyncio.to_thread(self.engine.generate)
-        
-        # Format outputs
-        outputs = []
-        for i, (req_id, text, tokens) in enumerate(
-            zip(request_ids, text_outputs, token_counts)
-        ):
-            outputs.append({
-                'request_id': req_id,
-                'text': text,
-                'num_tokens': tokens,
-                'finished': True,  # Full generation for now
-            })
+        async with self.lock:
+            # 1. Start new stream if idle and have pending
+            if self.generator is None and self.pending_requests:
+                # Move all pending to running
+                while self.pending_requests:
+                    # Dict popitem is LIFO (Stack). For FIFO use iterator
+                    # To be safe and compatible with original logic, we accept popitem
+                    # But ideally we want FIFO. Let's use list(keys) to be proper.
+                    keys = list(self.pending_requests.keys())
+                    for k in keys:
+                        self.running_requests[k] = self.pending_requests.pop(k)
+                
+                # Prepare engine args
+                prompts = []
+                sampling_params_list = []
+                request_ids = []
+                
+                for req_id, req in self.running_requests.items():
+                    prompts.append(req.prompt)
+                    pearl_params = self._convert_sampling_params(req.sampling_params)
+                    sampling_params_list.append(pearl_params)
+                    request_ids.append(req_id)
+                    
+                    # Reset state
+                    self.previous_texts[req_id] = ""
+                    self.processed_acc_indices[req_id] = 0
+                
+                # Add to engine
+                for prompt, params, req_id in zip(prompts, sampling_params_list, request_ids):
+                    self.engine.add_request(prompt, params, request_id=req_id)
+                
+                self.total_steps = 0  # <--- Initialize step counter
+                print(f"⚡ Starting generation stream for {len(prompts)} requests...")
+                self.generator = self.engine.stream_generate() # Returns iterator
+                self.generator_start_time = time.time()
+                self.total_gen_tokens = 0
             
-            # Remove completed request
-            if req_id in self.running_requests:
-                del self.running_requests[req_id]
-        
-        print(f"✅ Generated {len(outputs)} outputs, MAT: {mean_acceptance_tokens:.2f}")
-        return outputs
+            if self.generator is None:
+                await asyncio.sleep(0.001)
+                return []
+
+            # 2. Step
+            try:
+                def _next():
+                    return next(self.generator)
+                
+                # Run one step in thread
+                output_tuple, batch_finished = await asyncio.to_thread(_next)
+                self.total_steps += 1  # <--- Increment step counter
+                
+                # Unpack: seq_id, text, tokens, acc_counts, finished_flags
+                seq_ids, text_outputs, token_counts, acc_counts, finished_flags = output_tuple
+                
+                results = []
+                
+                for i, seq_id in enumerate(seq_ids):
+                    full_text = text_outputs[i]
+                    is_fin = finished_flags[i]
+                    
+                    # Diff logic
+                    prev_text = self.previous_texts.get(seq_id, "")
+                    diff_text = full_text[len(prev_text):]
+                    self.previous_texts[seq_id] = full_text
+                    
+                    # Throughput update
+                    acc_list = acc_counts[i]
+                    processed_idx = self.processed_acc_indices.get(seq_id, 0)
+                    new_acc_list = acc_list[processed_idx:]
+                    new_valid_tokens = sum(new_acc_list)
+                    self.total_gen_tokens += new_valid_tokens
+                    self.processed_acc_indices[seq_id] = len(acc_list)
+                    
+                    results.append({
+                        'request_id': seq_id,
+                        'text': full_text,
+                        'text_diff': diff_text, 
+                        'num_tokens': token_counts[i],
+                        'finished': is_fin
+                    })
+                    
+                    if is_fin:
+                        # Clean up this request
+                        if seq_id in self.running_requests:
+                            del self.running_requests[seq_id]
+                        if seq_id in self.previous_texts:
+                            del self.previous_texts[seq_id]
+                        if seq_id in self.processed_acc_indices:
+                            del self.processed_acc_indices[seq_id]
+
+                if batch_finished:
+                    elapsed = time.time() - self.generator_start_time
+                    tps = self.total_gen_tokens / elapsed if elapsed > 0 else 0
+                    
+                    # Calculate MAT (Mean Accepted Tokens per step)
+                    mat = self.total_gen_tokens / self.total_steps if self.total_steps > 0 else 0
+                    
+                    print(f"✅ Batch finished. Throughput: {tps:.2f} tok/s (Total: {self.total_gen_tokens}), MAT: {mat:.2f}")
+                    self.generator = None
+                
+                return results
+
+            except StopIteration:
+                self.generator = None
+                return []
+            except Exception as e:
+                print(f"❌ Error in generation step: {e}")
+                import traceback
+                traceback.print_exc()
+                self.generator = None
+                return []
     
     def abort_request(self, request_id: str) -> None:
         """Abort a request"""
