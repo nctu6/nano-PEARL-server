@@ -25,8 +25,7 @@ import time
 import uuid
 
 from minisgl_pearl.engine.pearl_engine import PEARLEngine
-import sys
-sys.path.insert(0, '/app/mini-sglang/python')
+# minisgl is now installed via pip, so we can import directly
 from minisgl.core import SamplingParams
 
 
@@ -38,12 +37,24 @@ app = FastAPI(title="Mini-SGLang-PEARL Server")
 
 
 @app.post("/v1/completions")
+@app.post("/v1/chat/completions")
 async def create_completion(request: Request):
     """OpenAI-compatible completions endpoint"""
     request_dict = await request.json()
     
     # Parse request
-    prompt = request_dict.get("prompt", "")
+    prompt = request_dict.get("prompt")
+    if not prompt and "messages" in request_dict:
+        # Convert messages to prompt (simple concatenation for now)
+        messages = request_dict["messages"]
+        if isinstance(messages, list):
+            prompt = "\n".join([str(m.get("content", "")) for m in messages if isinstance(m, dict)])
+        elif isinstance(messages, str):
+            prompt = messages
+            
+    if not prompt:
+        prompt = ""
+
     max_tokens = request_dict.get("max_tokens", 256)
     temperature = request_dict.get("temperature", 1.0)
     top_k = request_dict.get("top_k", 1)
@@ -147,7 +158,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Mini-SGLang-PEARL Server")
     parser.add_argument("--model", type=str, required=True, help="Path to target model")
     parser.add_argument("--draft-model", type=str, required=True, help="Path to draft model")
-    parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size")
+    parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size (for backward compatibility, sets target-tp)")
+    parser.add_argument("--draft-tp", type=int, default=None, help="Draft model tensor parallel size (default: 1)")
+    parser.add_argument("--target-tp", type=int, default=None, help="Target model tensor parallel size (default: same as --tp)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Server host")
     parser.add_argument("--port", type=int, default=30000, help="Server port")
     parser.add_argument("--max-num-seqs", type=int, default=512, help="Max number of sequences")
@@ -161,12 +174,18 @@ def main():
     
     args = parse_args()
     
+    # Set default TP sizes
+    draft_tp = args.draft_tp if args.draft_tp is not None else 1
+    target_tp = args.target_tp if args.target_tp is not None else args.tp
+    
     print("=" * 60)
     print("🚀 Starting Mini-SGLang-PEARL Server")
     print("=" * 60)
     print(f"Target Model: {args.model}")
     print(f"Draft Model: {args.draft_model}")
-    print(f"Tensor Parallel: {args.tp}")
+    print(f"Draft TP: {draft_tp}")
+    print(f"Target TP: {target_tp}")
+    print(f"Total GPUs needed: {draft_tp + target_tp}")
     print(f"Server: {args.host}:{args.port}")
     print("=" * 60)
     
@@ -174,8 +193,8 @@ def main():
     engine = PEARLEngine(
         model_path=args.model,
         draft_model_path=args.draft_model,
-        draft_tp_size=args.tp,
-        target_tp_size=args.tp,
+        draft_tp_size=draft_tp,
+        target_tp_size=target_tp,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
     )

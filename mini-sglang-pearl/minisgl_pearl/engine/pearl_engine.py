@@ -16,11 +16,23 @@ from dataclasses import dataclass
 
 # Import from mini-sglang for API compatibility
 import sys
-sys.path.insert(0, '/app/mini-sglang/python')
+import os
+
+# Get the base directory of nano-PEARL-server
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+# Add mini-sglang to path (if not already installed)
+# minisgl_path = os.path.join(BASE_DIR, 'mini-sglang', 'python')
+# if os.path.exists(minisgl_path):
+#     sys.path.insert(0, minisgl_path)
+
+# minisgl is now installed via pip, so we can import directly
 from minisgl.core import SamplingParams as MiniSGLSamplingParams
 
 # Import from nano-PEARL for engine
-sys.path.insert(0, '/app/nano-PEARL')
+nano_pearl_path = os.path.join(BASE_DIR, 'nano-PEARL')
+if os.path.exists(nano_pearl_path):
+    sys.path.insert(0, nano_pearl_path)
 from nano_pearl import PEARLConfig, PEARLEngine as NanoPEARLEngine
 from nano_pearl import SamplingParams as PEARLSamplingParams
 
@@ -125,7 +137,7 @@ class PEARLEngine:
         """Convert mini-sglang sampling params to nano-PEARL format"""
         return PEARLSamplingParams(
             temperature=minisgl_params.temperature,
-            top_k=minisgl_params.top_k,
+            # top_k is not supported in nano-PEARL yet
             max_tokens=minisgl_params.max_tokens,
             ignore_eos=minisgl_params.ignore_eos,
         )
@@ -164,7 +176,7 @@ class PEARLEngine:
             request_ids.append(req_id)
         
         # Clear requests for nano-PEARL
-        self.engine.scheduler.clear()
+        # self.engine.scheduler.clear()
         
         # Add all requests to nano-PEARL engine
         for prompt, params in zip(prompts, sampling_params_list):
