@@ -37,6 +37,14 @@ RUN python3 -m pip install flash-attn --no-build-isolation
 RUN python3 -m pip install -e build/nano-PEARL
 RUN python3 -m pip install -e build/FastChat
 
+# Install mini-sglang (reference only, not modified)
+COPY mini-sglang /app/build/mini-sglang
+RUN python3 -m pip install -e build/mini-sglang
+
+# Install mini-sglang-pearl integration  
+COPY mini-sglang-pearl /app/build/mini-sglang-pearl
+RUN python3 -m pip install -e build/mini-sglang-pearl
+
 RUN rm -rf /app/build
 
 CMD ["bash"]

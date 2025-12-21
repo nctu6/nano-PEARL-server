@@ -1,0 +1,23 @@
+services:
+  minisgl-pearl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: minisgl-pearl-server
+    network_mode: host
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0', '1']  # Adjust GPU IDs as needed
+              capabilities: [gpu]
+    volumes:
+      - ~/models:/weights
+      - .:/app
+    stdin_open: true
+    tty: true
+    command:
+      - bash
+      - pearls.sh
