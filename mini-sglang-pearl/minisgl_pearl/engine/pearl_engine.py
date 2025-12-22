@@ -121,6 +121,7 @@ class PEARLEngine:
         self.generator_start_time = 0
         self.total_gen_tokens = 0
         self._lock = None
+        self.last_log_time = 0
         
         print("✅ PEARL Engine initialized with nano-PEARL KV cache")
 
@@ -210,6 +211,7 @@ class PEARLEngine:
                 self.generator = self.engine.stream_generate() # Returns iterator
                 self.generator_start_time = time.time()
                 self.total_gen_tokens = 0
+                self.last_log_time = self.generator_start_time
             
             if self.generator is None:
                 await asyncio.sleep(0.001)
@@ -280,6 +282,15 @@ class PEARLEngine:
                     
                     print(f"✅ Batch finished. Throughput: {tps:.2f} tok/s (Total: {self.total_gen_tokens}), MAT: {mat:.2f}")
                     self.generator = None
+                else:
+                    now = time.time()
+                    if now - self.last_log_time >= 1.0:
+                        elapsed = now - self.generator_start_time
+                        tps = self.total_gen_tokens / elapsed if elapsed > 0 else 0
+                        mat = self.total_gen_tokens / self.total_steps if self.total_steps > 0 else 0
+                        inflight = len(self.running_requests) + len(self.pending_requests)
+                        print(f"📊 Streaming throughput: {tps:.2f} tok/s, MAT: {mat:.2f} tok/step, active={inflight}")
+                        self.last_log_time = now
                 
                 return results
 

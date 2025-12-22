@@ -19,7 +19,7 @@ import asyncio
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Dict, Optional
 import json
 import time
 import uuid
@@ -31,9 +31,53 @@ from minisgl.core import SamplingParams
 
 # Global engine  instance
 engine: PEARLEngine = None
+request_queues: Dict[str, asyncio.Queue] = {}
+dispatcher_task: Optional[asyncio.Task] = None
 
 # Create FastAPI app
 app = FastAPI(title="Mini-SGLang-PEARL Server")
+
+
+async def stream_dispatcher():
+    """Single fan-out loop so stream/non-stream requests share one generator."""
+    global dispatcher_task
+    try:
+        while True:
+            # Exit when no pending work and no listeners
+            unfinished = engine.get_num_unfinished_requests()
+            if not request_queues and unfinished == 0:
+                break
+            # If engine已無未完成但仍有等待的queue，強制送終止哨兵避免卡死
+            if unfinished == 0 and request_queues:
+                for q in list(request_queues.values()):
+                    try:
+                        q.put_nowait(None)
+                    except Exception:
+                        pass
+                request_queues.clear()
+                break
+
+            outputs = await engine.generate()
+            if not outputs:
+                await asyncio.sleep(0.001)
+                continue
+
+            for output in outputs:
+                queue = request_queues.get(output["request_id"])
+                if queue:
+                    await queue.put(output)
+                    if output.get("finished"):
+                        await queue.put(None)
+    except Exception as e:
+        print(f"❌ Stream dispatcher error: {e}")
+    finally:
+        # Signal all listeners to exit if dispatcher stops unexpectedly
+        for q in list(request_queues.values()):
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
+        dispatcher_task = None
 
 
 @app.post("/v1/completions")
@@ -51,20 +95,48 @@ async def create_completion(request: Request):
         # Convert messages array to prompt (OpenAI chat format)
         messages = request_dict["messages"]
         if isinstance(messages, list):
-            prompt_parts = []
-            for msg in messages:
-                if isinstance(msg, dict):
-                    role = msg.get("role", "user")
-                    content = msg.get("content", "")
-                    if role == "system":
-                        prompt_parts.append(f"System: {content}")
-                    elif role == "user":
-                        prompt_parts.append(f"User: {content}")
-                    elif role == "assistant":
-                        prompt_parts.append(f"Assistant: {content}")
-                    else:
-                        prompt_parts.append(content)
-            prompt = "\n".join(prompt_parts)
+            # Use tokenizer's chat template if available
+            if hasattr(engine.engine, "tokenizer") and hasattr(engine.engine.tokenizer, "apply_chat_template"):
+                try:
+                    prompt = engine.engine.tokenizer.apply_chat_template(
+                        messages, 
+                        tokenize=False, 
+                        add_generation_prompt=True
+                    )
+                except Exception as e:
+                    print(f"Error applying chat template: {e}")
+                    # Fallback to naive formatting if template fails
+                    prompt_parts = []
+                    for msg in messages:
+                        if isinstance(msg, dict):
+                            role = msg.get("role", "user")
+                            content = msg.get("content", "")
+                            if role == "system":
+                                prompt_parts.append(f"System: {content}")
+                            elif role == "user":
+                                prompt_parts.append(f"User: {content}")
+                            elif role == "assistant":
+                                prompt_parts.append(f"Assistant: {content}")
+                            else:
+                                prompt_parts.append(content)
+                    prompt = "\n".join(prompt_parts)
+            else:
+                # Fallback to naive formatting
+                prompt_parts = []
+                for msg in messages:
+                    if isinstance(msg, dict):
+                        role = msg.get("role", "user")
+                        content = msg.get("content", "")
+                        if role == "system":
+                            prompt_parts.append(f"System: {content}")
+                        elif role == "user":
+                            prompt_parts.append(f"User: {content}")
+                        elif role == "assistant":
+                            prompt_parts.append(f"Assistant: {content}")
+                        else:
+                            prompt_parts.append(content)
+                prompt = "\n".join(prompt_parts)
+
         elif isinstance(messages, str):
             prompt = messages
             
@@ -108,22 +180,35 @@ async def create_completion(request: Request):
         prompt_token_ids=prompt_token_ids,
         sampling_params=sampling_params,
     )
+
+    # Register queue for this request and ensure dispatcher is running
+    queue: asyncio.Queue = asyncio.Queue()
+    request_queues[request_id] = queue
+    global dispatcher_task
+    if dispatcher_task is None or dispatcher_task.done():
+        dispatcher_task = asyncio.create_task(stream_dispatcher())
     
     if stream:
         # Streaming response
         async def generate_stream() -> AsyncGenerator[str, None]:
-            while engine.get_num_unfinished_requests() > 0:
-                outputs = await engine.generate()
-                for output in outputs:
-                    if output['request_id'] == request_id:
-                        # Use text_diff if available for proper streaming
-                        chunk_text = output.get('text_diff', output.get('text', ''))
-                        
+            try:
+                while True:
+                    output = await queue.get()
+                    if output is None:
+                        break
+                    if output["request_id"] != request_id:
+                        continue
+
+                    # Use text_diff if available for proper streaming
+                    chunk_text = output.get('text_diff', output.get('text', ''))
+                    is_finished = output.get('finished')
+                    
+                    if chunk_text:
                         chunk = {
                             "id": request_id,
                             "object": "chat.completion.chunk",
                             "created": int(time.time()),
-                           "model": model,
+                            "model": model,
                             "choices": [{
                                 "index": 0,
                                 "delta": {
@@ -131,51 +216,50 @@ async def create_completion(request: Request):
                                     "reasoning_content": None
                                 },
                                 "logprobs": None,
-                                "finish_reason": "stop" if output.get('finished') else None,
-                                "stop_reason": None if output.get('finished') else None,
+                                "finish_reason": "stop" if is_finished else None,
+                                "stop_reason": None if is_finished else None,
                                 "token_ids": None
                             }]
                         }
                         yield f"data: {json.dumps(chunk)}\n\n"
-                        
-                        if output.get('finished'):
-                            # Send usage chunk
-                            usage_chunk = {
-                                "id": request_id,
-                                "object": "chat.completion.chunk",
-                                "created": int(time.time()),
-                                "model": model,
-                                "choices": [],
-                                "usage": {
-                                    "prompt_tokens": len(prompt_token_ids),
-                                    "total_tokens": len(prompt_token_ids) + output['num_tokens'],
-                                    "completion_tokens": output['num_tokens']
-                                }
+                    
+                    if is_finished:
+                        # Send usage chunk
+                        usage_chunk = {
+                            "id": request_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model,
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": len(prompt_token_ids),
+                                "total_tokens": len(prompt_token_ids) + output['num_tokens'],
+                                "completion_tokens": output['num_tokens']
                             }
-                            yield f"data: {json.dumps(usage_chunk)}\n\n"
-                            yield "data: [DONE]\n\n"
-                            return
-                 
-                await asyncio.sleep(0.001)
+                        }
+                        yield f"data: {json.dumps(usage_chunk)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        break
+            finally:
+                request_queues.pop(request_id, None)
          
         return StreamingResponse(generate_stream(), media_type="text/event-stream")
      
     else:
         # Non-streaming response
         final_output = None
-        while engine.get_num_unfinished_requests() > 0:
-            outputs = await engine.generate()
-            for output in outputs:
-                if output['request_id'] == request_id:
-                    final_output = output
-                    if output.get('finished'):
-                        break
-            
-            if final_output and final_output.get('finished'):
-                break
-                
-            if not final_output or not final_output.get('finished'):
-                await asyncio.sleep(0.001)
+        try:
+            while True:
+                output = await queue.get()
+                if output is None:
+                    break
+                if output["request_id"] != request_id:
+                    continue
+                final_output = output
+                if output.get('finished'):
+                    break
+        finally:
+            request_queues.pop(request_id, None)
 
         if final_output:
             return JSONResponse({

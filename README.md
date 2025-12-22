@@ -6,6 +6,14 @@ A high-performance speculative decoding server optimized for high-concurrency LL
 
 ---
 
+## 🗂️ Repository Layout & Service Flow
+- `mini-sglang-pearl/`: FastAPI/OpenAI server + continuous batching scheduler; wraps `nano_pearl.PEARLEngine` (draft + target speculative decoding, native KV cache). Streaming uses單一 generator + per-request queue，避免併發搶 generator。
+- `nano-PEARL/`: 核心 speculative 解碼引擎、CUDA/FlashAttention/Triton kernels、KV cache 管理。
+- `mini-sglang/`: 連續 batching 基礎（vendored），API 相容層。
+- Scripts: `pearls.sh`（啟動/清理 /dev/shm）、`stress_test.py`（併發階梯 TTFT/MAT/吞吐）、`monitor_streaming.py`（串流 TUI）、`benchmark_speculative.py`（Auto Gamma 後的 perf）。
+- Logs: `server*.log`; Docker: `docker-compose*.yml`, `Dockerfile`.
+- 監控：服務執行時每秒輸出 `📊 Streaming throughput`（tok/s，計入 acc token）與 MAT；批次完成時亦輸出總吞吐/MAT。
+
 ## 🎯 Project Overview
 
 nano-PEARL-server is UnieAI's flagship project focused on **speculative decoding optimization for high-concurrency scenarios**. By combining draft-target model verification with intelligent batch scheduling, we achieve significant throughput improvements while maintaining output quality.
@@ -81,7 +89,7 @@ nano-PEARL-server is UnieAI's flagship project focused on **speculative decoding
 │  │ │ blocks      │ │  │                           │  │ │ blocks      │ │  │
 │  │ └─────────────┘ │  │                           │  │ └─────────────┘ │  │
 │  │  • Allocate     │  │                           │  │  • Allocate     │  │
-│  │  • Free         │  │                           │  push │  • Free         │  │
+│  │  • Free         │  │                           │  │  • Free         │  │
 │  │  • Copy (fork)  │  │                           │  │  • Copy (fork)  │  │
 │  └─────────────────┘  │                           │  └─────────────────┘  │
 │           ↓           │                           │           ↓           │
