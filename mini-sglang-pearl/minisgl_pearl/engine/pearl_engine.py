@@ -73,6 +73,7 @@ class PEARLEngine:
         max_model_len: int = 4096,
         gpu_memory_utilization: float = 0.9,
         enable_benchmark: bool = False,
+        batch_collect_ms: float = 5.0,
         **kwargs
     ):
         """
@@ -92,6 +93,9 @@ class PEARLEngine:
         print("🚀 Initializing PEARL Engine with nano-PEARL KV cache...")
         
         self.enable_benchmark = enable_benchmark
+        # Small collect window to coalesce near-simultaneous requests into one batch.
+        # This avoids starting multiple tiny batches when requests arrive a few ms apart.
+        self.batch_collect_ms = batch_collect_ms
         
         # Create nano-PEARL configuration
         self.pearl_config = PEARLConfig(
@@ -118,8 +122,10 @@ class PEARLEngine:
         self.generator = None
         self.previous_texts = {}
         self.processed_acc_indices = {}
+        self.prev_out_counts = {}
         self.generator_start_time = 0
         self.total_gen_tokens = 0
+        self.total_out_tokens = 0
         self._lock = None
         self.last_log_time = 0
         
@@ -176,6 +182,15 @@ class PEARLEngine:
         Returns partial outputs or empty list if no new data.
         """
         async with self.lock:
+            # When the generator is idle, wait briefly to gather more pending
+            # requests so they can start together instead of fragmenting into
+            # multiple small batches.
+            if self.generator is None and self.pending_requests and self.batch_collect_ms > 0:
+                await asyncio.sleep(self.batch_collect_ms / 1000)
+                # Log a hint when we intentionally delay to coalesce
+                if len(self.pending_requests) > 1:
+                    print(f"⏳ Batch coalescing {len(self.pending_requests)} pending for {self.batch_collect_ms}ms")
+
             # 1. Start new stream if idle and have pending
             if self.generator is None and self.pending_requests:
                 # Move all pending to running
@@ -201,17 +216,21 @@ class PEARLEngine:
                     # Reset state
                     self.previous_texts[req_id] = ""
                     self.processed_acc_indices[req_id] = 0
+                    self.prev_out_counts[req_id] = 0
                 
                 # Add to engine
                 for prompt, params, req_id in zip(prompts, sampling_params_list, request_ids):
                     self.engine.add_request(prompt, params, request_id=req_id)
                 
                 self.total_steps = 0  # <--- Initialize step counter
+                self.total_out_tokens = 0
                 print(f"⚡ Starting generation stream for {len(prompts)} requests...")
                 self.generator = self.engine.stream_generate() # Returns iterator
                 self.generator_start_time = time.time()
                 self.total_gen_tokens = 0
                 self.last_log_time = self.generator_start_time
+                for req_id in request_ids:
+                    self.prev_out_counts[req_id] = 0
             
             if self.generator is None:
                 await asyncio.sleep(0.001)
@@ -255,6 +274,12 @@ class PEARLEngine:
                     new_valid_tokens = sum(new_acc_list)
                     self.total_gen_tokens += new_valid_tokens
                     self.processed_acc_indices[seq_id] = len(acc_list)
+
+                    # Track user-visible output tokens
+                    prev_out = self.prev_out_counts.get(seq_id, 0)
+                    new_out_tokens = max(0, token_counts[i] - prev_out)
+                    self.total_out_tokens += new_out_tokens
+                    self.prev_out_counts[seq_id] = token_counts[i]
                     
                     results.append({
                         'request_id': seq_id,
@@ -272,24 +297,30 @@ class PEARLEngine:
                             del self.previous_texts[seq_id]
                         if seq_id in self.processed_acc_indices:
                             del self.processed_acc_indices[seq_id]
+                        if seq_id in self.prev_out_counts:
+                            del self.prev_out_counts[seq_id]
 
                 if batch_finished:
                     elapsed = time.time() - self.generator_start_time
-                    tps = self.total_gen_tokens / elapsed if elapsed > 0 else 0
+                    acc_tps = self.total_gen_tokens / elapsed if elapsed > 0 else 0
+                    out_tps = self.total_out_tokens / elapsed if elapsed > 0 else 0
                     
-                    # Calculate MAT (Mean Accepted Tokens per step)
-                    mat = self.total_gen_tokens / self.total_steps if self.total_steps > 0 else 0
+                    # MAT (Mean tokens per step)
+                    mat_out = self.total_out_tokens / self.total_steps if self.total_steps > 0 else 0
+                    mat_acc = self.total_gen_tokens / self.total_steps if self.total_steps > 0 else 0
                     
-                    print(f"✅ Batch finished. Throughput: {tps:.2f} tok/s (Total: {self.total_gen_tokens}), MAT: {mat:.2f}")
+                    print(f"✅ Batch finished. Throughput: {out_tps:.2f} out_tok/s (user) | {acc_tps:.2f} acc_tok/s (accepted), MAT_out: {mat_out:.2f}, MAT_acc: {mat_acc:.2f}, Total_out: {self.total_out_tokens}")
                     self.generator = None
                 else:
                     now = time.time()
                     if now - self.last_log_time >= 1.0:
                         elapsed = now - self.generator_start_time
-                        tps = self.total_gen_tokens / elapsed if elapsed > 0 else 0
-                        mat = self.total_gen_tokens / self.total_steps if self.total_steps > 0 else 0
+                        acc_tps = self.total_gen_tokens / elapsed if elapsed > 0 else 0
+                        out_tps = self.total_out_tokens / elapsed if elapsed > 0 else 0
+                        mat_out = self.total_out_tokens / self.total_steps if self.total_steps > 0 else 0
+                        mat_acc = self.total_gen_tokens / self.total_steps if self.total_steps > 0 else 0
                         inflight = len(self.running_requests) + len(self.pending_requests)
-                        print(f"📊 Streaming throughput: {tps:.2f} tok/s, MAT: {mat:.2f} tok/step, active={inflight}")
+                        print(f"📊 Streaming throughput: {out_tps:.2f} out_tok/s (user) | {acc_tps:.2f} acc_tok/s (accepted), MAT_out: {mat_out:.2f}, MAT_acc: {mat_acc:.2f}, active={inflight}")
                         self.last_log_time = now
                 
                 return results

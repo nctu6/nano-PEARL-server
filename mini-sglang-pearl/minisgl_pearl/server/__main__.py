@@ -170,8 +170,24 @@ async def create_completion(request: Request):
     # Generate request ID
     request_id = f"req-{uuid.uuid4().hex[:8]}"
     
-    # Tokenize prompt (simple split for now, should use tokenizer)
-    prompt_token_ids = list(range(len(prompt.split())))  # Placeholder
+    # Tokenize prompt: prefer engine tokenizer, fallback to whitespace split.
+    try:
+        if hasattr(engine.engine, "tokenizer"):
+            # Protect tokenizer with lock if present
+            tok = engine.engine.tokenizer
+            lock = getattr(engine.engine, "tokenizer_lock", None)
+            if lock:
+                with lock:
+                    prompt_token_ids = tok.encode(prompt)
+            else:
+                prompt_token_ids = tok.encode(prompt)
+        else:
+            prompt_token_ids = prompt.split()
+    except Exception:
+        prompt_token_ids = prompt.split()
+    # Ensure token ids are integers for usage stats
+    if prompt_token_ids and not isinstance(prompt_token_ids[0], int):
+        prompt_token_ids = list(range(len(prompt_token_ids)))
     
     # Add request to engine
     engine.add_request(
