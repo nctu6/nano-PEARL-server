@@ -1,0 +1,19 @@
+                        yield f"data: {json.dumps(chunk)}\\n\\n"
+                        
+                        if output.get('finished'):
+                            # Send usage chunk
+                            usage_chunk = {
+                                "id": request_id,
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": len(prompt_token_ids),
+                                    "total_tokens": len(prompt_token_ids) + output['num_tokens'],
+                                    "completion_tokens": output['num_tokens']
+                                }
+                            }
+                            yield f"data: {json.dumps(usage_chunk)}\\n\\n"
+                            yield "data: [DONE]\\n\\n"
+                            return

@@ -12,6 +12,8 @@ import aiohttp
 import json
 import random
 import time
+import math
+import statistics
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -58,6 +60,11 @@ class RequestStats:
         if self.first_token_time is None or self.completion_tokens <= 0:
             return None
         return (self.end_time - self.first_token_time) / max(self.completion_tokens, 1)
+
+    @property
+    def throughput(self) -> float:
+        dur = max(self.end_time - self.start_time, 1e-6)
+        return self.completion_tokens / dur
 
 
 async def wait_for_health():
@@ -120,18 +127,24 @@ async def send_stream_request(session: aiohttp.ClientSession, prompt: str, idx: 
                     except Exception:
                         continue
 
+                    now = time.time()
+
                     # Usage chunk carries token counts
                     if "usage" in data:
                         usage = data["usage"] or {}
                         prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
                         completion_tokens = usage.get("completion_tokens", completion_tokens)
+                        if first_token_time is None:
+                            # Fallback: if the first meaningful chunk is usage, treat it as TTFT.
+                            first_token_time = now
                         continue
 
                     # Regular delta chunk
                     if first_token_time is None:
                         delta = data.get("choices", [{}])[0].get("delta", {})
-                        if delta.get("content"):
-                            first_token_time = time.time()
+                        # If any delta chunk arrives (even empty content), mark TTFT to avoid missing non-streaming cases.
+                        if delta or delta.get("content") is not None:
+                            first_token_time = now
 
             end = time.time()
             return RequestStats(
@@ -168,37 +181,69 @@ async def send_stream_request(session: aiohttp.ClientSession, prompt: str, idx: 
 
 
 def summarize(concurrency: int, results: List[RequestStats], wall_time: float, iterations: int) -> str:
+    def percentile(values: List[float], p: float) -> float:
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return values[0]
+        ordered = sorted(values)
+        k = (len(ordered) - 1) * p
+        f = math.floor(k)
+        c = math.ceil(k)
+        if f == c:
+            return ordered[int(k)]
+        return ordered[f] * (c - k) + ordered[c] * (k - f)
+
+    def stats(values: List[float]):
+        if not values:
+            return (0.0, 0.0, 0.0, 0.0)
+        return (
+            percentile(values, 0.50),
+            percentile(values, 0.95),
+            percentile(values, 0.99),
+            statistics.pstdev(values),
+        )
+
     successes = [r for r in results if r.status == 200]
     failures = len(results) - len(successes)
 
     total_output_tokens = sum(r.completion_tokens for r in successes)
     total_input_tokens = sum(r.prompt_tokens for r in successes)
     suc_count = len(successes) or 1
+    avg_out_per_req = total_output_tokens / suc_count
+    avg_in_per_req = total_input_tokens / suc_count
 
     ttft_values = [r.ttft for r in successes if r.ttft is not None]
-    avg_ttft = sum(ttft_values) / len(ttft_values) if ttft_values else 0.0
+    ttft_p50, ttft_p95, ttft_p99, ttft_std = stats(ttft_values)
 
-    itl_values = [r.itl for r in successes if r.itl is not None]
-    avg_itl = sum(itl_values) / len(itl_values) if itl_values else 0.0
+    latency_values = [r.latency for r in successes]
+    lat_p50, lat_p95, lat_p99, lat_std = stats(latency_values)
+
+    tp_values = [r.throughput for r in successes]
+    tp_p50, tp_p95, tp_p99, tp_std = stats(tp_values)
 
     rps = len(successes) / wall_time if wall_time > 0 else 0.0
     rpm = rps * 60
+    # Per-user view: average throughput across requests
+    avg_req_tp = sum(tp_values) / len(tp_values) if tp_values else 0.0
+    # Aggregate view: tokens over wall time
     total_throughput = total_output_tokens / wall_time if wall_time > 0 else 0.0
-    output_throughput = total_throughput
-    input_throughput = total_input_tokens / wall_time if wall_time > 0 else 0.0
-    out_tp_per_req = output_throughput / suc_count
 
     return (
         f"{concurrency:>5} | "
         f"{len(successes):>4}/{len(results):<4} | "
         f"{total_output_tokens:>10} | "
         f"{wall_time:>7.2f}s | "
-        f"{total_throughput:>8.2f} tok/s | "
-        f"{output_throughput:>8.2f} out/s | "
-        f"{out_tp_per_req:>8.2f} out/r | "
-        f"{input_throughput:>8.2f} in/s | "
-        f"{avg_ttft*1000:>7.1f} ms TTFT | "
-        f"{avg_itl*1000:>7.1f} ms ITL | "
+        f"{total_throughput:>8.2f} tok/s (agg) | "
+        f"{avg_req_tp:>8.2f} tok/s/req avg | "
+        f"{tp_p50:>7.2f}/{tp_p95:>7.2f}/{tp_p99:>7.2f} tok/s req p50/p95/p99 | "
+        f"{tp_std:>7.2f} tp std | "
+        f"{avg_out_per_req:>7.1f} avg_out | "
+        f"{avg_in_per_req:>7.1f} avg_in | "
+        f"{ttft_p50*1000:>7.1f}/{ttft_p95*1000:>7.1f}/{ttft_p99*1000:>7.1f} ms TTFT p50/p95/p99 | "
+        f"{ttft_std*1000:>7.1f} ms TTFT std | "
+        f"{lat_p50*1000:>7.1f}/{lat_p95*1000:>7.1f}/{lat_p99*1000:>7.1f} ms latency p50/p95/p99 | "
+        f"{lat_std*1000:>7.1f} ms latency std | "
         f"{rps:>6.2f} RPS | "
         f"{rpm:>7.1f} RPM | "
         f"fail={failures} | iters={iterations}"
@@ -206,19 +251,35 @@ def summarize(concurrency: int, results: List[RequestStats], wall_time: float, i
 
 
 async def run_level(concurrency: int, iterations: int) -> str:
+    """Run fixed-concurrency pool; refill as soon as a request completes.
+    Total requests = iterations * concurrency (for compatibility with prior default).
+    """
     all_results: List[RequestStats] = []
-    total_wall = 0.0
+    total_requests = iterations * concurrency
+    started = 0
+    start_lock = asyncio.Lock()
 
     async with aiohttp.ClientSession() as session:
-        for _ in range(iterations):
-            prompts = [random.choice(PROMPTS) for _ in range(concurrency)]
-            tasks = [send_stream_request(session, prompts[i], i) for i in range(concurrency)]
-            batch_start = time.time()
-            results = await asyncio.gather(*tasks)
-            batch_end = time.time()
-            total_wall += (batch_end - batch_start)
-            all_results.extend(results)
+        sem = asyncio.Semaphore(concurrency)
 
+        async def worker(idx: int):
+            nonlocal started
+            while True:
+                async with start_lock:
+                    if started >= total_requests:
+                        return
+                    started += 1
+                prompt = random.choice(PROMPTS)
+                async with sem:
+                    stats = await send_stream_request(session, prompt, idx)
+                all_results.append(stats)
+
+        pool_start = time.time()
+        workers = [asyncio.create_task(worker(i)) for i in range(concurrency)]
+        await asyncio.gather(*workers)
+        pool_end = time.time()
+
+    total_wall = pool_end - pool_start
     return summarize(concurrency, all_results, total_wall, iterations)
 
 
@@ -243,7 +304,7 @@ async def main():
     await wait_for_health()
 
     header = (
-        " conc | succ  | total_tok |  time   |  total_tp |  out_tp |  out/r  |   in_tp |   TTFT  |    ITL  |   RPS |    RPM  | fail | iters"
+        " conc | succ  | total_tok |  time   |  total_tp |  avg_tp |    tp p50/p95/p99       |  tp std | avg_out | avg_in |        TTFT p50/p95/p99 (ms)        |  TTFT std |      Lat p50/p95/p99 (ms)       | Lat std |   RPS |    RPM  | fail | iters"
     )
     print(header)
     print("-" * len(header))

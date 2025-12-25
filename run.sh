@@ -1,0 +1,23 @@
+#!/bin/bash
+# Launch mini-sglang-pearl server with nano-PEARL KV cache
+
+# Cleanup shared memory on exit
+cleanup() {
+    rm -f /dev/shm/draft_group /dev/shm/target_group
+}
+trap cleanup EXIT
+
+export PYTORCH_ALLOC_CONF=expandable_segments:True
+
+python -m minisgl_pearl.server \
+    --model /home/ubuntu/models/Qwen/Qwen3-32B \
+    --draft-model /home/ubuntu/models/Qwen/Qwen3-1.7B \
+    --draft-tp 1 \
+    --target-tp 1 \
+    --port 30000 \
+    --host 0.0.0.0 \
+    --max-num-seqs 512 \
+    --max-num-batched-tokens 16384 \
+    --gpu-memory-utilization 0.85 2>&1 | tee run.log
+    #--benchmark  # Enable speculative decoding benchmark (optional, comment out to skip)
+
